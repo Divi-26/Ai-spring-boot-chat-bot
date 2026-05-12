@@ -1,0 +1,217 @@
+name: Bid Management CI/CD
+
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "*"
+  workflow_dispatch:
+
+env:
+  ARTIFACT: bid_management
+  MAVEN_M2_PATH: /home/github/.m2
+  MAVEN_CLI_OPTS: -s ${{ env.MAVEN_M2_PATH }}/settings.xml --batch-mode
+  MAVEN_REPOSITORY_PATH: ${{ env.MAVEN_M2_PATH }}/repository/com/expd/bidmgmt/web/bid_management
+  PROVISIONING_PROJECT: oxp-strategic-investments/si-provisioning
+  PROXY_SETTINGS_PATH: ${{ env.MAVEN_M2_PATH }}/proxy-settings.xml
+
+jobs:
+
+# -------------------------
+# BUILD
+# -------------------------
+build:
+  name: Feature Branch Build
+  runs-on: self-hosted
+  if: |
+    github.ref != 'refs/heads/dev-branch' &&
+    github.ref != 'refs/heads/master' &&
+    !startsWith(github.ref, 'refs/tags/')
+  steps:
+    - uses: actions/checkout@v4
+
+    - name: Environment Info
+      run: |
+        git --version
+        whoami
+        java -version
+        mvn $MAVEN_CLI_OPTS -version
+
+    - name: Build & Test
+      run: mvn $MAVEN_CLI_OPTS clean install
+
+# -------------------------
+# OWASP SCAN
+# -------------------------
+scan:
+  name: OWASP Dependency Scan
+  runs-on: self-hosted
+  needs: build
+  continue-on-error: true
+  env:
+    FAIL_ON_CVSS: 7
+    NODE_AUDIT_ENABLED: "false"
+  steps:
+    - uses: actions/checkout@v4
+
+    - name: Run OWASP Scan
+      run: |
+        mvn dependency-check:check \
+          -Ddependency-check.skip=false \
+          -Ddependency-check-maven.failBuildOnCVSS=$FAIL_ON_CVSS \
+          -DnodeAuditAnalyzerEnabled=$NODE_AUDIT_ENABLED \
+          -s $PROXY_SETTINGS_PATH
+
+    - name: Publish OWASP Report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: owasp-report
+        path: target/dependency-check-report.html
+        retention-days: 7
+
+# -------------------------
+# PUBLISH TO NEXUS
+# -------------------------
+publish_artifact:
+  name: Publish Artifact to Nexus
+  runs-on: self-hosted
+  if: |
+    github.ref == 'refs/heads/dev-branch' ||
+    github.ref == 'refs/heads/master'
+  steps:
+    - uses: actions/checkout@v4
+
+    - name: Set Artifact Version
+      id: version
+      run: |
+        POM_VERSION=$(mvn $MAVEN_CLI_OPTS org.apache.maven.plugins:maven-help-plugin:3.2.0:evaluate -Dexpression=project.version -q -DforceStdout)
+        ARTIFACT_VERSION="${POM_VERSION%-LOCAL}-$(date -u +%Y%m%d%H%M%S)-${GITHUB_SHA::8}"
+        mvn $MAVEN_CLI_OPTS versions:set -DnewVersion=$ARTIFACT_VERSION
+        echo "ARTIFACT_VERSION=$ARTIFACT_VERSION" >> $GITHUB_ENV
+
+    - name: Deploy to Nexus
+      run: mvn $MAVEN_CLI_OPTS -U clean deploy -DskipTests
+
+    - name: Clean Local Maven Repo
+      run: rm -rf $MAVEN_REPOSITORY_PATH
+
+# -------------------------
+# DEPLOY STG (FEATURE BRANCH)
+# -------------------------
+deploy_stg:
+  name: Deploy to STG
+  runs-on: ubuntu-latest
+  needs: publish_artifact
+  if: |
+    github.ref != 'refs/heads/dev-branch' &&
+    github.ref != 'refs/heads/master'
+  steps:
+    - name: Trigger Provisioning (STG)
+      uses: peter-evans/repository-dispatch@v3
+      with:
+        repository: ${{ env.PROVISIONING_PROJECT }}
+        event-type: deploy
+        client-payload: |
+          {
+            "environment": "bidmgmt-stg",
+            "version": "${{ env.ARTIFACT_VERSION }}"
+          }
+
+# -------------------------
+# PROMOTE TO QA
+# -------------------------
+promote_nonprod:
+  name: Promote Artifact to NonProd
+  runs-on: self-hosted
+  needs: publish_artifact
+  if: |
+    github.ref == 'refs/heads/dev-branch' ||
+    github.ref == 'refs/heads/master'
+  environment:
+    name: QA
+  steps:
+    - name: Promote in Nexus
+      run: |
+        echo "Promoting $ARTIFACT_VERSION from pipeline_builds to pipeline_nonprod"
+
+# -------------------------
+# DEPLOY QA
+# -------------------------
+deploy_qa:
+  name: Deploy to QA
+  runs-on: ubuntu-latest
+  needs: promote_nonprod
+  steps:
+    - name: Trigger Provisioning (QA)
+      uses: peter-evans/repository-dispatch@v3
+      with:
+        repository: ${{ env.PROVISIONING_PROJECT }}
+        event-type: deploy
+        client-payload: |
+          {
+            "environment": "bidmgmt-qa",
+            "version": "${{ env.ARTIFACT_VERSION }}"
+          }
+
+# -------------------------
+# APPROVE PROD
+# -------------------------
+approve_prod:
+  name: Approve PROD Deployment
+  runs-on: self-hosted
+  if: startsWith(github.ref, 'refs/tags/')
+  environment:
+    name: PROD
+  steps:
+    - name: Approval Gate
+      run: echo "Production deployment approved for $ARTIFACT_VERSION"
+
+# -------------------------
+# PROMOTE TO PROD
+# -------------------------
+promote_prod:
+  name: Promote Artifact to PROD
+  runs-on: self-hosted
+  needs: approve_prod
+  steps:
+    - name: Promote in Nexus
+      run: |
+        echo "Promoting $ARTIFACT_VERSION from pipeline_nonprod to pipeline_prod"
+
+# -------------------------
+# DEPLOY PROD
+# -------------------------
+deploy_prod:
+  name: Deploy to PROD
+  runs-on: ubuntu-latest
+  needs: promote_prod
+  if: startsWith(github.ref, 'refs/tags/')
+  steps:
+    - name: Trigger Provisioning (PROD)
+      uses: peter-evans/repository-dispatch@v3
+      with:
+        repository: ${{ env.PROVISIONING_PROJECT }}
+        event-type: deploy
+        client-payload: |
+          {
+            "environment": "bidmgmt-prod",
+            "version": "${{ env.ARTIFACT_VERSION }}"
+          }
+
+# -------------------------
+# DOCUMENTATION (Pages)
+# -------------------------
+documentation:
+  name: Build Documentation
+  runs-on: self-hosted
+  steps:
+    - name: Generate Docs
+      run: |
+        mkdir -p public
+        echo "<html><body>Empty content</body></html>" >> public/about.html
+
+    - uses: actions/upload-pages-artifact@v3
+      with:
+        path: public
